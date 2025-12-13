@@ -179,8 +179,8 @@ class MicroAirEasyTouchBluetoothDeviceData(BluetoothData):
         return hr_status
 
     @retry_bluetooth_connection_error(attempts=7)
-    async def _connect_to_device(self, ble_device: BLEDevice):
-        """Connect to the device with retries."""
+    async def _connect_to_device_impl(self, ble_device: BLEDevice):
+        """Internal implementation of device connection."""
         try:
             self._client = await establish_connection(
                 BleakClientWithServiceCache,
@@ -197,6 +197,15 @@ class MicroAirEasyTouchBluetoothDeviceData(BluetoothData):
         except Exception as e:
             _LOGGER.error("Connection error: %s", str(e))
             raise
+    
+    async def _connect_to_device(self, ble_device: BLEDevice, ble_lock: asyncio.Lock | None = None):
+        """Connect to the device with retries."""
+        # Serialize connection attempts to prevent concurrent connections
+        if ble_lock:
+            async with ble_lock:
+                return await self._connect_to_device_impl(ble_device)
+        else:
+            return await self._connect_to_device_impl(ble_device)
 
     @retry_authentication(retries=3, delay=2)
     async def authenticate(self, password: str) -> bool:
@@ -227,13 +236,23 @@ class MicroAirEasyTouchBluetoothDeviceData(BluetoothData):
             self._client = None
             return False
 
-    async def _write_gatt_with_retry(self, hass, uuid: str, data: bytes, ble_device: BLEDevice, retries: int = 3) -> bool:
+    async def _write_gatt_with_retry(self, hass, uuid: str, data: bytes, ble_device: BLEDevice, retries: int = 3, ble_lock: asyncio.Lock | None = None) -> bool:
         """Write GATT characteristic with retry and adaptive delay."""
+        # Serialize writes to prevent concurrent operations
+        if ble_lock:
+            async with ble_lock:
+                return await self._write_gatt_with_retry_impl(hass, uuid, data, ble_device, retries)
+        else:
+            return await self._write_gatt_with_retry_impl(hass, uuid, data, ble_device, retries)
+    
+    async def _write_gatt_with_retry_impl(self, hass, uuid: str, data: bytes, ble_device: BLEDevice, retries: int = 3) -> bool:
+        """Internal implementation of GATT write with retry."""
         last_error = None
         for attempt in range(retries):
             try:
                 if not self._client or not self._client.is_connected:
-                    if not await self._reconnect_and_authenticate(hass, ble_device):
+                    # Note: _reconnect_and_authenticate will handle its own locking
+                    if not await self._reconnect_and_authenticate(hass, ble_device, None):
                         return False
                 write_delay = self._get_operation_delay(hass, ble_device.address, 'write')
                 if write_delay > 0:
@@ -250,13 +269,16 @@ class MicroAirEasyTouchBluetoothDeviceData(BluetoothData):
         _LOGGER.error("GATT write failed after %d attempts: %s", retries, str(last_error))
         return False
 
-    async def _reconnect_and_authenticate(self, hass, ble_device: BLEDevice) -> bool:
+    async def _reconnect_and_authenticate(self, hass, ble_device: BLEDevice, ble_lock: asyncio.Lock | None = None) -> bool:
         """Reconnect and re-authenticate with adaptive delays."""
+        # Note: This is called from within locked contexts, so we don't lock again here
+        # The lock is passed through to _connect_to_device which handles it
         try:
             connect_delay = self._get_operation_delay(hass, ble_device.address, 'connect')
             if connect_delay > 0:
                 await asyncio.sleep(connect_delay)
-            self._client = await self._connect_to_device(ble_device)
+            # Pass None for lock since we're already in a locked context if called from locked method
+            self._client = await self._connect_to_device_impl(ble_device)
             if not self._client or not self._client.is_connected:
                 self._increase_operation_delay(hass, ble_device.address, 'connect')
                 return False
@@ -275,13 +297,23 @@ class MicroAirEasyTouchBluetoothDeviceData(BluetoothData):
             self._increase_operation_delay(hass, ble_device.address, 'connect')
             return False
 
-    async def _read_gatt_with_retry(self, hass, characteristic, ble_device: BLEDevice, retries: int = 3) -> bytes | None:
+    async def _read_gatt_with_retry(self, hass, characteristic, ble_device: BLEDevice, retries: int = 3, ble_lock: asyncio.Lock | None = None) -> bytes | None:
         """Read GATT characteristic with retry and operation-specific delay."""
+        # Serialize reads to prevent concurrent operations
+        if ble_lock:
+            async with ble_lock:
+                return await self._read_gatt_with_retry_impl(hass, characteristic, ble_device, retries)
+        else:
+            return await self._read_gatt_with_retry_impl(hass, characteristic, ble_device, retries)
+    
+    async def _read_gatt_with_retry_impl(self, hass, characteristic, ble_device: BLEDevice, retries: int = 3) -> bytes | None:
+        """Internal implementation of GATT read with retry."""
         last_error = None
         for attempt in range(retries):
             try:
                 if not self._client or not self._client.is_connected:
-                    if not await self._reconnect_and_authenticate(hass, ble_device):
+                    # Note: _reconnect_and_authenticate will handle its own locking
+                    if not await self._reconnect_and_authenticate(hass, ble_device, None):
                         return None
                 read_delay = self._get_operation_delay(hass, ble_device.address, 'read')
                 if read_delay > 0:
@@ -298,11 +330,20 @@ class MicroAirEasyTouchBluetoothDeviceData(BluetoothData):
         _LOGGER.error("GATT read failed after %d attempts: %s", retries, str(last_error))
         return None
 
-    async def reboot_device(self, hass, ble_device: BLEDevice) -> bool:
+    async def reboot_device(self, hass, ble_device: BLEDevice, ble_lock: asyncio.Lock | None = None) -> bool:
         """Reboot the device by sending reset command."""
+        # Serialize reboot to prevent concurrent operations
+        if ble_lock:
+            async with ble_lock:
+                return await self._reboot_device_impl(hass, ble_device)
+        else:
+            return await self._reboot_device_impl(hass, ble_device)
+    
+    async def _reboot_device_impl(self, hass, ble_device: BLEDevice) -> bool:
+        """Internal implementation of device reboot."""
         try:
             self._ble_device = ble_device
-            self._client = await self._connect_to_device(ble_device)
+            self._client = await self._connect_to_device_impl(ble_device)
             if not self._client or not self._client.is_connected:
                 _LOGGER.error("Failed to connect for reboot")
                 return False
@@ -337,21 +378,94 @@ class MicroAirEasyTouchBluetoothDeviceData(BluetoothData):
             self._client = None
             self._ble_device = None
 
-    async def send_command(self, hass, ble_device: BLEDevice, command: dict) -> bool:
+    async def send_command(self, hass, ble_device: BLEDevice, command: dict, ble_lock: asyncio.Lock | None = None) -> bool:
         """Send command to device."""
+        # Serialize command sending to prevent concurrent operations
+        if ble_lock:
+            async with ble_lock:
+                return await self._send_command_impl(hass, ble_device, command)
+        else:
+            return await self._send_command_impl(hass, ble_device, command)
+    
+    async def _send_command_impl(self, hass, ble_device: BLEDevice, command: dict) -> bool:
+        """Internal implementation of command sending."""
         try:
             if not self._client or not self._client.is_connected:
-                self._client = await self._connect_to_device(ble_device)
+                self._client = await self._connect_to_device_impl(ble_device)
                 if not self._client or not self._client.is_connected:
                     return False
                 if not await self.authenticate(self._password):
                     return False
             command_bytes = json.dumps(command).encode()
-            return await self._write_gatt_with_retry(hass, UUIDS["jsonCmd"], command_bytes, ble_device)
+            # Pass None for lock since we're already in a locked context
+            return await self._write_gatt_with_retry_impl(hass, UUIDS["jsonCmd"], command_bytes, ble_device)
         except Exception as e:
             _LOGGER.error("Error sending command: %s", str(e))
             return False
         finally:
+            try:
+                if self._client and self._client.is_connected:
+                    await self._client.disconnect()
+            except Exception as e:
+                _LOGGER.debug("Error disconnecting: %s", str(e))
+            self._client = None
+    
+    async def send_command_and_read(
+        self, hass, ble_device: BLEDevice, command: dict, read_uuid: str, ble_lock: asyncio.Lock | None = None
+    ) -> bytes | None:
+        """
+        Send command and read response in a single connection.
+        This is more efficient than send_command() followed by _read_gatt_with_retry()
+        as it avoids disconnecting and reconnecting.
+        """
+        # Serialize operations to prevent concurrent access
+        if ble_lock:
+            async with ble_lock:
+                return await self._send_command_and_read_impl(hass, ble_device, command, read_uuid)
+        else:
+            return await self._send_command_and_read_impl(hass, ble_device, command, read_uuid)
+    
+    async def _send_command_and_read_impl(
+        self, hass, ble_device: BLEDevice, command: dict, read_uuid: str
+    ) -> bytes | None:
+        """Internal implementation of send command and read."""
+        try:
+            # Connect if needed
+            if not self._client or not self._client.is_connected:
+                self._client = await self._connect_to_device_impl(ble_device)
+                if not self._client or not self._client.is_connected:
+                    return None
+                if not await self.authenticate(self._password):
+                    return None
+            
+            # Send command
+            command_bytes = json.dumps(command).encode()
+            write_success = await self._write_gatt_with_retry_impl(hass, UUIDS["jsonCmd"], command_bytes, ble_device)
+            if not write_success:
+                return None
+            
+            # Small delay to allow device to process
+            await asyncio.sleep(0.5)
+            
+            # Read response (reuse existing connection)
+            read_delay = self._get_operation_delay(hass, ble_device.address, 'read')
+            if read_delay > 0:
+                await asyncio.sleep(read_delay)
+            
+            try:
+                result = await self._client.read_gatt_char(read_uuid)
+                self._adjust_operation_delay(hass, ble_device.address, 'read')
+                return result
+            except BleakError as e:
+                _LOGGER.debug("GATT read failed: %s", str(e))
+                self._increase_operation_delay(hass, ble_device.address, 'read')
+                return None
+                
+        except Exception as e:
+            _LOGGER.error("Error in send_command_and_read: %s", str(e))
+            return None
+        finally:
+            # Disconnect after both operations complete
             try:
                 if self._client and self._client.is_connected:
                     await self._client.disconnect()

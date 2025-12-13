@@ -5,11 +5,11 @@ import logging
 import time
 import voluptuous as vol
 
-from homeassistant.components.bluetooth import async_ble_device_from_address
 from homeassistant.core import HomeAssistant, ServiceCall
 import homeassistant.helpers.config_validation as cv
 
 from .const import DOMAIN
+from . import get_ble_device_with_adapter
 from .micro_air_easytouch.parser import MicroAirEasyTouchBluetoothDeviceData
 
 _LOGGER = logging.getLogger(__name__)
@@ -47,11 +47,16 @@ async def async_register_services(hass: HomeAssistant) -> None:
         mac_address = config_entry.unique_id
         assert mac_address is not None
 
-        # Get BLE device
-        ble_device = async_ble_device_from_address(hass, mac_address)
+        # Get BLE device with adapter preference
+        ble_device = get_ble_device_with_adapter(hass, mac_address, config_entry.entry_id)
         if not ble_device:
             _LOGGER.error("Could not find BLE device for address %s", mac_address)
             return
+
+        # Get the BLE lock to serialize operations
+        ble_lock = None
+        if config_entry.entry_id in hass.data.get(DOMAIN, {}):
+            ble_lock = hass.data[DOMAIN][config_entry.entry_id].get("ble_lock")
 
         # Construct the command
         command = {
@@ -64,7 +69,7 @@ async def async_register_services(hass: HomeAssistant) -> None:
 
         # Send the command
         try:
-            success = await device_data.send_command(hass, ble_device, command)
+            success = await device_data.send_command(hass, ble_device, command, ble_lock)
             if success:
                 _LOGGER.info("Successfully sent location (LAT: %s, LON: %s) to device %s", latitude, longitude, mac_address)
             else:

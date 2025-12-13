@@ -1,6 +1,7 @@
 """Support for MicroAirEasyTouch climate control."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import json
 import time
@@ -20,9 +21,9 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.components.bluetooth import async_ble_device_from_address
 
 from .const import DOMAIN
+from . import get_ble_device_with_adapter
 from .micro_air_easytouch.parser import MicroAirEasyTouchBluetoothDeviceData
 from .micro_air_easytouch.const import (
     UUIDS,
@@ -42,8 +43,13 @@ async def async_setup_entry(
 ) -> None:
     """Set up MicroAirEasyTouch climate platform."""
     data = hass.data[DOMAIN][config_entry.entry_id]["data"]
-    entity = MicroAirEasyTouchClimate(data, config_entry.unique_id)
+    entity = MicroAirEasyTouchClimate(data, config_entry.unique_id, config_entry.entry_id)
     async_add_entities([entity])
+    
+    # Store entity reference so it can be updated from advertisement callbacks
+    if "entities" not in hass.data[DOMAIN][config_entry.entry_id]:
+        hass.data[DOMAIN][config_entry.entry_id]["entities"] = []
+    hass.data[DOMAIN][config_entry.entry_id]["entities"].append(entity)
 
 class MicroAirEasyTouchClimate(ClimateEntity):
     """Representation of MicroAirEasyTouch Climate."""
@@ -57,6 +63,9 @@ class MicroAirEasyTouchClimate(ClimateEntity):
     _attr_temperature_unit = UnitOfTemperature.FAHRENHEIT
     _attr_hvac_modes = list(HA_MODE_TO_EASY_MODE.keys())
     _attr_should_poll = True
+    # Poll more frequently for better responsiveness (15 seconds)
+    # State changes also update immediately after commands
+    SCAN_INTERVAL = 15
 
     # Map our modes to Home Assistant fan icons
     _FAN_MODE_ICONS = {
@@ -98,10 +107,11 @@ class MicroAirEasyTouchClimate(ClimateEntity):
         "auto": [128],
     }
 
-    def __init__(self, data: MicroAirEasyTouchBluetoothDeviceData, mac_address: str) -> None:
+    def __init__(self, data: MicroAirEasyTouchBluetoothDeviceData, mac_address: str, entry_id: str) -> None:
         """Initialize the climate."""
         self._data = data
         self._mac_address = mac_address
+        self._entry_id = entry_id
         self._attr_unique_id = f"microaireasytouch_{mac_address}_climate"
         self._attr_name = "EasyTouch Climate"
         self._attr_device_info = DeviceInfo(
@@ -131,29 +141,38 @@ class MicroAirEasyTouchClimate(ClimateEntity):
 
     async def _async_fetch_initial_state(self) -> None:
         """Fetch the initial state from the device."""
-        ble_device = async_ble_device_from_address(self.hass, self._mac_address)
+        ble_device = get_ble_device_with_adapter(self.hass, self._mac_address, self._entry_id)
         if not ble_device:
             _LOGGER.error("Could not find BLE device: %s", self._mac_address)
             self._state = {}
             return
 
+        # Get the BLE lock to serialize operations
+        ble_lock = None
+        if self._entry_id in self.hass.data.get(DOMAIN, {}):
+            ble_lock = self.hass.data[DOMAIN][self._entry_id].get("ble_lock")
+
         message = {"Type": "Get Status", "Zone": 0, "EM": self._data._email, "TM": int(time.time())}
         try:
-            if await self._data.send_command(self.hass, ble_device, message):
-                json_payload = await self._data._read_gatt_with_retry(self.hass, UUIDS["jsonReturn"], ble_device)
-                if json_payload:
-                    self._state = self._data.decrypt(json_payload.decode('utf-8'))
-                    _LOGGER.debug("Initial state fetched: %s", self._state)
-                    self.async_write_ha_state()
-                else:
-                    self._state = {}
-                    _LOGGER.warning("No payload received for initial state")
+            # Use combined send+read to avoid double connection (much faster)
+            json_payload = await self._data.send_command_and_read(
+                self.hass, ble_device, message, UUIDS["jsonReturn"], ble_lock
+            )
+            if json_payload:
+                self._state = self._data.decrypt(json_payload.decode('utf-8'))
+                _LOGGER.debug("Initial state fetched: %s", self._state)
+                self.async_write_ha_state()
             else:
-                self._state = {}
-                _LOGGER.warning("Failed to send command for initial state")
+                # Preserve last known state instead of clearing it
+                if not self._state:
+                    _LOGGER.warning("No payload received for initial state and no previous state available")
+                else:
+                    _LOGGER.warning("No payload received for initial state, preserving last known state")
         except Exception as e:
             _LOGGER.error("Failed to fetch initial state: %s", str(e))
-            self._state = {}
+            # Preserve last known state instead of clearing it
+            if not self._state:
+                _LOGGER.warning("No previous state available after error")
 
     @property
     def current_temperature(self) -> float | None:
@@ -188,8 +207,45 @@ class MicroAirEasyTouchClimate(ClimateEntity):
     @property
     def hvac_mode(self) -> HVACMode:
         """Return hvac operation mode."""
+        # Check current_mode_num first - this is what the device is actually doing
+        # mode_num is the setpoint (what mode is configured), but current_mode_num is the actual state
+        current_mode_num = self._state.get("current_mode_num", 0)
         mode_num = self._state.get("mode_num", 0)
-        return EASY_MODE_TO_HA_MODE.get(mode_num, HVACMode.OFF)
+        current_mode = self._state.get("current_mode")
+        off_flag = self._state.get("off")
+        on_flag = self._state.get("on")
+        
+        # Debug logging to help diagnose power state detection
+        _LOGGER.debug(
+            "hvac_mode check: current_mode_num=%s, mode_num=%s, current_mode=%s, off=%s, on=%s",
+            current_mode_num, mode_num, current_mode, off_flag, on_flag
+        )
+        
+        # If current_mode_num is 0, device is actually off regardless of mode_num
+        if current_mode_num == 0:
+            _LOGGER.debug("Device is OFF (current_mode_num=0)")
+            return HVACMode.OFF
+        
+        # Check if device is powered off via param flags
+        if off_flag is True:
+            _LOGGER.debug("Device is OFF (off flag=True)")
+            return HVACMode.OFF
+        
+        # If 'on' flag is explicitly False, device is off
+        if on_flag is False:
+            _LOGGER.debug("Device is OFF (on flag=False)")
+            return HVACMode.OFF
+        
+        # If current_mode is "off", device is off
+        if current_mode == "off":
+            _LOGGER.debug("Device is OFF (current_mode='off')")
+            return HVACMode.OFF
+        
+        # Otherwise, use mode_num (the configured/set mode)
+        # This represents what mode the user has selected, even if currently idle
+        result = EASY_MODE_TO_HA_MODE.get(mode_num, HVACMode.OFF)
+        _LOGGER.debug("Device mode: %s (from mode_num=%s)", result, mode_num)
+        return result
 
     @property
     def hvac_action(self) -> HVACAction | None:
@@ -246,10 +302,15 @@ class MicroAirEasyTouchClimate(ClimateEntity):
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
         """Set new target temperature."""
-        ble_device = async_ble_device_from_address(self.hass, self._mac_address)
+        ble_device = get_ble_device_with_adapter(self.hass, self._mac_address, self._entry_id)
         if not ble_device:
             _LOGGER.error("Could not find BLE device")
             return
+
+        # Get the BLE lock to serialize operations
+        ble_lock = None
+        if self._entry_id in self.hass.data.get(DOMAIN, {}):
+            ble_lock = self.hass.data[DOMAIN][self._entry_id].get("ble_lock")
 
         changes = {"zone": 0, "power": 1}
         if ATTR_TEMPERATURE in kwargs:
@@ -266,14 +327,24 @@ class MicroAirEasyTouchClimate(ClimateEntity):
 
         if changes:
             message = {"Type": "Change", "Changes": changes}
-            await self._data.send_command(self.hass, ble_device, message)
+            success = await self._data.send_command(self.hass, ble_device, message, ble_lock)
+            if success:
+                # Immediately refresh state after successful command to update UI
+                # Wait a moment for device to process the change
+                await asyncio.sleep(1.0)
+                await self._async_fetch_initial_state()
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set new target hvac mode."""
-        ble_device = async_ble_device_from_address(self.hass, self._mac_address)
+        ble_device = get_ble_device_with_adapter(self.hass, self._mac_address, self._entry_id)
         if not ble_device:
             _LOGGER.error("Could not find BLE device")
             return
+
+        # Get the BLE lock to serialize operations
+        ble_lock = None
+        if self._entry_id in self.hass.data.get(DOMAIN, {}):
+            ble_lock = self.hass.data[DOMAIN][self._entry_id].get("ble_lock")
 
         mode = HA_MODE_TO_EASY_MODE.get(hvac_mode)
         if mode is not None:
@@ -285,14 +356,24 @@ class MicroAirEasyTouchClimate(ClimateEntity):
                     "mode": mode,
                 },
             }
-            await self._data.send_command(self.hass, ble_device, message)
+            success = await self._data.send_command(self.hass, ble_device, message, ble_lock)
+            if success:
+                # Immediately refresh state after successful command to update UI
+                # Wait a moment for device to process the change
+                await asyncio.sleep(1.0)
+                await self._async_fetch_initial_state()
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
         """Set new target fan mode using standard Home Assistant names."""
-        ble_device = async_ble_device_from_address(self.hass, self._mac_address)
+        ble_device = get_ble_device_with_adapter(self.hass, self._mac_address, self._entry_id)
         if not ble_device:
             _LOGGER.error("Could not find BLE device")
             return
+
+        # Get the BLE lock to serialize operations
+        ble_lock = None
+        if self._entry_id in self.hass.data.get(DOMAIN, {}):
+            ble_lock = self.hass.data[DOMAIN][self._entry_id].get("ble_lock")
 
         # Map standard name to device value
         if self.hvac_mode == HVACMode.FAN_ONLY:
@@ -305,7 +386,11 @@ class MicroAirEasyTouchClimate(ClimateEntity):
             else:
                 fan_value = 0
             message = {"Type": "Change", "Changes": {"zone": 0, "fanOnly": fan_value}}
-            await self._data.send_command(self.hass, ble_device, message)
+            success = await self._data.send_command(self.hass, ble_device, message, ble_lock)
+            if success:
+                # Immediately refresh state after successful command to update UI
+                await asyncio.sleep(1.0)
+                await self._async_fetch_initial_state()
         else:
             if fan_mode == "off":
                 fan_value = 0
@@ -325,7 +410,11 @@ class MicroAirEasyTouchClimate(ClimateEntity):
             elif self.hvac_mode == HVACMode.AUTO:
                 changes["autoFan"] = fan_value
             message = {"Type": "Change", "Changes": changes}
-            await self._data.send_command(self.hass, ble_device, message)
+            success = await self._data.send_command(self.hass, ble_device, message, ble_lock)
+            if success:
+                # Immediately refresh state after successful command to update UI
+                await asyncio.sleep(1.0)
+                await self._async_fetch_initial_state()
 
     async def async_update(self) -> None:
         """Update the entity state manually if needed."""

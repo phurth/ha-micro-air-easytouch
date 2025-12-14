@@ -45,11 +45,6 @@ async def async_setup_entry(
     data = hass.data[DOMAIN][config_entry.entry_id]["data"]
     entity = MicroAirEasyTouchClimate(data, config_entry.unique_id, config_entry.entry_id)
     async_add_entities([entity])
-    
-    # Store entity reference so it can be updated from advertisement callbacks
-    if "entities" not in hass.data[DOMAIN][config_entry.entry_id]:
-        hass.data[DOMAIN][config_entry.entry_id]["entities"] = []
-    hass.data[DOMAIN][config_entry.entry_id]["entities"].append(entity)
 
 class MicroAirEasyTouchClimate(ClimateEntity):
     """Representation of MicroAirEasyTouch Climate."""
